@@ -185,15 +185,15 @@ server.registerTool("plan_register", {
   },
 }, async ({ rootPath, planFile, objective, steps, deliverables, taskId }) => {
   try {
-    if (!taskExists(taskId)) {
+    if (!await taskExists(taskId)) {
       return err(`tâche inconnue : ${taskId || "(vide)"} — un plan doit être rattaché à une tâche existante`);
     }
     const abs = resolvePlanFile(rootPath, planFile);
     if (!existsSync(abs)) return err(`fichier plan introuvable : ${abs}`);
     const id = planIdOf(planFile);
-    if (getPlan(id)) return err(`plan déjà enregistré : ${id}`);
+    if (await getPlan(id)) return err(`plan déjà enregistré : ${id}`);
     const list = (steps && steps.length ? steps : extractSteps(abs));
-    const plan = createPlan({
+    const plan = await createPlan({
       id,
       taskId,
       objective: objective || id.replace(/^Plan-/, "").replace(/-\d{8}-\d{6}$/, "").replace(/-/g, " "),
@@ -215,7 +215,7 @@ server.registerTool("plan_list", {
   inputSchema: { rootPath: z.string().describe("Racine du projet.") },
 }, async () => {
   try {
-    const plans = listPlans().map((p) => ({
+    const plans = (await listPlans()).map((p) => ({
       id: p.id,
       taskId: p.taskId,
       objective: p.objective,
@@ -237,7 +237,7 @@ server.registerTool("plan_get", {
   inputSchema: { rootPath: z.string(), planId: z.string() },
 }, async ({ planId }) => {
   try {
-    const p = requirePlan(planId);
+    const p = await requirePlan(planId);
     return text(JSON.stringify(p, null, 2));
   } catch (e) {
     return err(e.message);
@@ -254,7 +254,7 @@ server.registerTool("plan_set_branch", {
   },
 }, async ({ planId, branch }) => {
   try {
-    const p = setPlanBranch(planId, branch);
+    const p = await setPlanBranch(planId, branch);
     if (!p) return err(`plan inconnu : ${planId}`);
     return text(JSON.stringify({ ok: true, plan: p }, null, 2));
   } catch (e) {
@@ -274,16 +274,16 @@ server.registerTool("progress_update", {
   },
 }, async ({ planId, stepId, status, note }) => {
   try {
-    const before = requirePlan(planId);
+    const before = await requirePlan(planId);
     if (!before.progress[stepId]) return err(`étape inconnue : ${stepId} (étapes du plan : ${before.steps.join(", ")})`);
-    let plan = updateStepStatus(planId, stepId, status, note || "");
+    let plan = await updateStepStatus(planId, stepId, status, note || "");
     if (!plan) return err(`plan inconnu : ${planId}`);
     if (status === "done" || status === "skipped") {
       const st = progressStats(plan.progress);
       if (st.todo === 0 && st.in_progress === 0 && st.blocked === 0 && st.done + st.skipped > 0) {
-        plan = setPlanStatus(planId, "completed");
+        plan = await setPlanStatus(planId, "completed");
       } else {
-        plan = setPlanStatus(planId, "active");
+        plan = await setPlanStatus(planId, "active");
       }
     }
     const doc = writeProgressionDoc(plan);
@@ -299,7 +299,7 @@ server.registerTool("progress_get", {
   inputSchema: { rootPath: z.string(), planId: z.string() },
 }, async ({ planId }) => {
   try {
-    const p = requirePlan(planId);
+    const p = await requirePlan(planId);
     return text(JSON.stringify({ planId, objective: p.objective, status: p.status, progress: progressStats(p.progress), steps: p.progress }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -319,8 +319,8 @@ server.registerTool("incident_create", {
   },
 }, async ({ planId, stepId, severity, title, description }) => {
   try {
-    requirePlan(planId);
-    const incident = createIncident({ planId, stepId: stepId || null, severity, title, description });
+    await requirePlan(planId);
+    const incident = await createIncident({ planId, stepId: stepId || null, severity, title, description });
     const doc = writeIncidentDoc(incident);
     const mail = sendMail(`[PLAN] Incident ${incident.id} — ${title}`, `Incident rattaché au plan ${planId}${stepId ? ` (étape ${stepId})` : ""}\nSévérité : ${severity}\n\n${description}\n\nDocument : ${doc}`);
     return text(JSON.stringify({ ok: true, incidentId: incident.id, document: doc, notified: mail.ok, mailError: mail.error || null }, null, 2));
@@ -335,7 +335,7 @@ server.registerTool("incident_resolve", {
   inputSchema: { rootPath: z.string(), incidentId: z.string(), resolution: z.string() },
 }, async ({ incidentId, resolution }) => {
   try {
-    const inc = resolveIncident(incidentId, resolution);
+    const inc = await resolveIncident(incidentId, resolution);
     if (!inc) return err(`incident inconnu : ${incidentId}`);
     const doc = writeIncidentDoc(inc);
     const mail = sendMail(`[PLAN] Incident ${incidentId} résolu`, `Résolution : ${resolution}\n\nDocument : ${doc}`);
@@ -355,7 +355,7 @@ server.registerTool("incident_list", {
   },
 }, async ({ planId, status }) => {
   try {
-    const incidents = listIncidents({ planId, status });
+    const incidents = await listIncidents({ planId, status });
     return text(JSON.stringify({ incidents }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -374,8 +374,8 @@ server.registerTool("inconsistency_create", {
   },
 }, async ({ planId, stepId, description, relatedPlanId }) => {
   try {
-    requirePlan(planId);
-    const inco = createInconsistency({ planId, stepId: stepId || null, relatedPlanId: relatedPlanId || null, description });
+    await requirePlan(planId);
+    const inco = await createInconsistency({ planId, stepId: stepId || null, relatedPlanId: relatedPlanId || null, description });
     const doc = writeInconsistencyDoc(inco);
     const mail = sendMail(`[PLAN] Incohérence ${inco.id}`, `Incohérence détectée sur le plan ${planId}${stepId ? ` (étape ${stepId})` : ""}${relatedPlanId ? ` — plan lié : ${relatedPlanId}` : ""}\n\n${description}\n\nDocument : ${doc}`);
     return text(JSON.stringify({ ok: true, inconsistencyId: inco.id, document: doc, notified: mail.ok, mailError: mail.error || null }, null, 2));
@@ -390,7 +390,7 @@ server.registerTool("inconsistency_list", {
   inputSchema: { rootPath: z.string(), planId: z.string().optional() },
 }, async ({ planId }) => {
   try {
-    const inconsistencies = listInconsistencies({ planId });
+    const inconsistencies = await listInconsistencies({ planId });
     return text(JSON.stringify({ inconsistencies }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -404,7 +404,7 @@ server.registerTool("treatments_list", {
 }, async ({ planId }) => {
   try {
     const rows = [];
-    for (const p of listPlans()) {
+    for (const p of await listPlans()) {
       if (planId && p.id !== planId) continue;
       for (const step of p.steps) {
         const st = (p.progress[step] || {}).status || "todo";
@@ -424,10 +424,10 @@ server.registerTool("plan_report", {
   inputSchema: { rootPath: z.string(), planId: z.string() },
 }, async ({ planId }) => {
   try {
-    const p = requirePlan(planId);
+    const p = await requirePlan(planId);
     const st = progressStats(p.progress);
-    const incs = listIncidents({ planId });
-    const incos = listInconsistencies({ planId });
+    const incs = await listIncidents({ planId });
+    const incos = await listInconsistencies({ planId });
     const lines = [];
     lines.push(`# Rapport de statut — ${planId}`);
     lines.push("");

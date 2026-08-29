@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
-    "better-sqlite3": "^11.10.0",
+    "pg": "^8.23.0",
     "zod": "^4.4.3"
   }
 }
