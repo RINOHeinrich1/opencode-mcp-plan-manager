@@ -1,0 +1,15 @@
+{
+  "name": "plan-manager-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for managing atomic-plan generated plans (progression, incidents, inconsistencies, notifications, status reports).",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "plan-manager-mcp": "index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "better-sqlite3": "^11.10.0",
+    "zod": "^4.4.3"
+  }
+}
