@@ -5,21 +5,19 @@
  * Principes :
  *  - Les plans (Plan-<objectif>-<date>.md) sont IMMUABLES : ce serveur ne les
  *    modifie jamais.
- *  - La source de vérité de la persistance des plans est désormais la base
- *    SQLite partagée `registry.db` (tables plans/plan_steps/plan_incidents/
+ *  - La source de vérité de la persistance des plans est la base partagée
+ *    `registry.db` (tables plans/plan_steps/plan_incidents/
  *    plan_inconsistencies/plan_counters — cf. db.mjs). Les documents markdown
- *    (progression, incidents, incohérences, rapports) ne sont plus que des
- *    artefacts TRANSITOIRES (pièces jointes d'email), écrits sous
- *    /tmp/opencode/plan-manager/.
- *  - Les incidents et incohérences déclenchent une notification email.
+ *    (progression, incidents, incohérences, rapports) sont des artefacts
+ *    TRANSITOIRES, écrits sous /tmp/opencode/plan-manager/.
+ *  - Les incidents et incohérences sont persistés en base : leur notification
+ *    est dérivée par le daemon `opencode-notifier` (aucun email ici).
  */
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { resolve, join, basename, isAbsolute } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
 import {
   createPlan,
   getPlan,
@@ -36,8 +34,6 @@ import {
   taskExists,
   setPlanBranch,
 } from "./db.mjs";
-
-const MAIL_SCRIPT = join(homedir(), ".config", "opencode", "scripts", "send-mail.mjs");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -59,17 +55,6 @@ function stamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
-
-function sendMail(subject, body, attachment) {
-  try {
-    const args = ["--subject", subject, "--body", body];
-    if (attachment) args.push("--attachment", attachment);
-    execFileSync("node", [MAIL_SCRIPT, ...args], { stdio: "pipe" });
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
-  }
 }
 
 // Documents transitoires (non persistants) — uniquement pour pièces jointes.
@@ -322,8 +307,7 @@ server.registerTool("incident_create", {
     await requirePlan(planId);
     const incident = await createIncident({ planId, stepId: stepId || null, severity, title, description });
     const doc = writeIncidentDoc(incident);
-    const mail = sendMail(`[PLAN] Incident ${incident.id} — ${title}`, `Incident rattaché au plan ${planId}${stepId ? ` (étape ${stepId})` : ""}\nSévérité : ${severity}\n\n${description}\n\nDocument : ${doc}`);
-    return text(JSON.stringify({ ok: true, incidentId: incident.id, document: doc, notified: mail.ok, mailError: mail.error || null }, null, 2));
+    return text(JSON.stringify({ ok: true, incidentId: incident.id, document: doc }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -331,15 +315,14 @@ server.registerTool("incident_create", {
 
 // === incident_resolve ===
 server.registerTool("incident_resolve", {
-  description: "Clôt un incident avec une résolution, persisté en base. Notification email envoyée.",
+  description: "Clôt un incident avec une résolution, persisté en base.",
   inputSchema: { rootPath: z.string(), incidentId: z.string(), resolution: z.string() },
 }, async ({ incidentId, resolution }) => {
   try {
     const inc = await resolveIncident(incidentId, resolution);
     if (!inc) return err(`incident inconnu : ${incidentId}`);
     const doc = writeIncidentDoc(inc);
-    const mail = sendMail(`[PLAN] Incident ${incidentId} résolu`, `Résolution : ${resolution}\n\nDocument : ${doc}`);
-    return text(JSON.stringify({ ok: true, incidentId, status: "resolved", document: doc, notified: mail.ok }, null, 2));
+    return text(JSON.stringify({ ok: true, incidentId, status: "resolved", document: doc }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -364,7 +347,7 @@ server.registerTool("incident_list", {
 
 // === inconsistency_create ===
 server.registerTool("inconsistency_create", {
-  description: "Signale une incohérence détectée à l'exécution d'un plan (contradiction, conflit inter-plans...), persistée en base. Génère un document transitoire + notification email. Ne modifie jamais le plan.",
+  description: "Signale une incohérence détectée à l'exécution d'un plan (contradiction, conflit inter-plans...), persistée en base. Génère un document transitoire. Ne modifie jamais le plan.",
   inputSchema: {
     rootPath: z.string(),
     planId: z.string(),
@@ -377,8 +360,7 @@ server.registerTool("inconsistency_create", {
     await requirePlan(planId);
     const inco = await createInconsistency({ planId, stepId: stepId || null, relatedPlanId: relatedPlanId || null, description });
     const doc = writeInconsistencyDoc(inco);
-    const mail = sendMail(`[PLAN] Incohérence ${inco.id}`, `Incohérence détectée sur le plan ${planId}${stepId ? ` (étape ${stepId})` : ""}${relatedPlanId ? ` — plan lié : ${relatedPlanId}` : ""}\n\n${description}\n\nDocument : ${doc}`);
-    return text(JSON.stringify({ ok: true, inconsistencyId: inco.id, document: doc, notified: mail.ok, mailError: mail.error || null }, null, 2));
+    return text(JSON.stringify({ ok: true, inconsistencyId: inco.id, document: doc }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -464,19 +446,6 @@ server.registerTool("plan_report", {
   } catch (e) {
     return err(e.message);
   }
-});
-
-// === notify ===
-server.registerTool("notify", {
-  description: "Envoie une notification email (subject/body, pièce jointe optionnelle) via le script send-mail.mjs.",
-  inputSchema: {
-    subject: z.string(),
-    body: z.string(),
-    attachment: z.string().optional().describe("Chemin absolu d'une pièce jointe (optionnel)."),
-  },
-}, async ({ subject, body, attachment }) => {
-  const r = sendMail(subject, body, attachment);
-  return text(JSON.stringify({ ok: r.ok, error: r.error || null }, null, 2));
 });
 
 // ---------------------------------------------------------------------------
