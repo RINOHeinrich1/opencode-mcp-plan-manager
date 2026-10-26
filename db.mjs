@@ -7,6 +7,7 @@
 import pg from "pg";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFileSync, existsSync } from "node:fs";
 import { loadGlobalEnv } from "../../scripts/load-env.mjs";
 
 const { Pool } = pg;
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS plan_steps (
   position   INTEGER NOT NULL DEFAULT 0,
   status     TEXT NOT NULL DEFAULT 'todo',
   note       TEXT,
+  files      TEXT,
   updated_at TEXT,
   PRIMARY KEY (plan_id, step_id)
 );
@@ -113,6 +115,8 @@ async function ensureSchema() {
   if (!_schemaPromise) {
     _schemaPromise = (async () => {
       await pool().query(SCHEMA);
+      // Phase 3 : fichiers par étape de plan (colonnes ajoutées après coup).
+      await pool().query("ALTER TABLE plan_steps ADD COLUMN IF NOT EXISTS files TEXT");
       _schemaReady = true;
     })();
   }
@@ -184,13 +188,18 @@ async function planStepsRows(planId) {
   return res.rows;
 }
 
+function parseFiles(raw) {
+  if (!raw) return [];
+  try { const a = JSON.parse(raw); return Array.isArray(a) ? a.filter(Boolean) : []; } catch { return []; }
+}
+
 async function rowToPlan(row) {
   if (!row) return null;
   const progress = {};
   const steps = [];
   for (const s of await planStepsRows(row.id)) {
     steps.push(s.step_id);
-    progress[s.step_id] = { status: s.status, note: s.note || "", updatedAt: s.updated_at || "" };
+    progress[s.step_id] = { status: s.status, note: s.note || "", updatedAt: s.updated_at || "", files: parseFiles(s.files) };
   }
   const incRes = await pool().query("SELECT id FROM plan_incidents WHERE plan_id = $1 ORDER BY seq", [row.id]);
   const incoRes = await pool().query("SELECT id FROM plan_inconsistencies WHERE plan_id = $1 ORDER BY seq", [row.id]);
@@ -205,14 +214,16 @@ async function rowToPlan(row) {
     branch: row.branch,
     createdAt: row.created_at,
     steps,
+    stepFiles: Object.fromEntries(steps.map((s) => [s, progress[s].files])),
     progress,
     incidents: incRes.rows.map((r) => r.id),
     inconsistencies: incoRes.rows.map((r) => r.id),
   };
 }
 
-export async function createPlan({ id, taskId, objective, file, absolutePath, deliverables, steps }) {
+export async function createPlan({ id, taskId, objective, file, absolutePath, deliverables, steps, stepFiles }) {
   await ensureSchema();
+  const filesByStep = stepFiles || {};
   await withTransaction(async (client) => {
     await client.query(
       `INSERT INTO plans (id, task_id, objective, file, absolute_path, deliverables, status, created_at)
@@ -221,10 +232,11 @@ export async function createPlan({ id, taskId, objective, file, absolutePath, de
     );
     const list = steps || [];
     for (let i = 0; i < list.length; i++) {
+      const files = filesByStep[list[i]] || [];
       await client.query(
-        `INSERT INTO plan_steps (plan_id, step_id, position, status, note, updated_at)
-         VALUES ($1,$2,$3,'todo',NULL,NULL)`,
-        [id, list[i], i],
+        `INSERT INTO plan_steps (plan_id, step_id, position, status, note, files, updated_at)
+         VALUES ($1,$2,$3,'todo',NULL,$4,NULL)`,
+        [id, list[i], i, files.length ? JSON.stringify(files) : null],
       );
     }
   });
@@ -261,7 +273,67 @@ export async function listPlans() {
 export async function getPlanSteps(id) {
   await ensureSchema();
   const rows = await planStepsRows(id);
-  return rows.map((s) => ({ stepId: s.step_id, position: s.position, status: s.status, note: s.note || "", updatedAt: s.updated_at || "" }));
+  return rows.map((s) => ({ stepId: s.step_id, position: s.position, status: s.status, note: s.note || "", updatedAt: s.updated_at || "", files: parseFiles(s.files) }));
+}
+
+// Parse le fichier Plan-*.md pour extraire { stepId: [fichiers] } (Phase 3).
+// Colonne fichier DÉTECTÉE par contenu (un chemin avec extension / un `…/…`),
+// pas par position fixe (le tableau peut avoir 6 ou 7 colonnes selon le plan).
+function extractStepFilesFromFile(absPath) {
+  if (!existsSync(absPath)) return {};
+  const txt = readFileSync(absPath, "utf8");
+  const out = {};
+  const FILE_RE = /`([^`]*(?:\.(?:tsx?|jsx?|mjs|cjs|json|md|feature|css|html|sql|yml|yaml|py|vue))[^`]*)`|`([^`]*\/[^`]*)`/gi;
+  const plausible = (p) => {
+    const s = String(p || "").trim();
+    if (!s || /\s/.test(s)) return false;
+    if (s.startsWith("npm") || s.startsWith("git") || s.startsWith("yarn")) return false;
+    return /\.(tsx?|jsx?|mjs|cjs|json|md|css|html|sql|ya?ml|py|vue|feature|env)$/i.test(s) || /\*\.([a-z0-9]+)$/i.test(s);
+  };
+  for (const line of txt.split(/\r?\n/)) {
+    if (!line.startsWith("|")) continue;
+    const cells = line.split("|").slice(1, -1).map((c) => c.trim());
+    if (!cells.length || !/^[A-Z]\d{3}$/.test(cells[0])) continue;
+    const all = [];
+    for (const c of cells) {
+      for (const m of c.matchAll(FILE_RE)) { const v = m[1] || m[2]; if (v && plausible(v)) all.push(v.trim()); }
+    }
+    if (!all.length) {
+      for (const c of cells) {
+        const m = /([A-Za-z0-9_\-./]+\.(?:tsx?|jsx?|mjs|cjs|md|json|css|feature))/.exec(c);
+        if (m && plausible(m[1])) all.push(m[1]);
+      }
+    }
+    if (all.length) out[cells[0]] = [...new Set(all.map((p) => p.replace(/^\.?\//, "")))];
+  }
+  return out;
+}
+
+// Backfill Phase 3 : pour les plans dont les étapes n'ont pas encore de fichiers,
+// met à jour `plan_steps.files` depuis le fichier Plan-*.md (chemin absolu).
+// Idempotent : ne traite que les étapes `files IS NULL`. Appelé au démarrage.
+export async function backfillStepFiles() {
+  await ensureSchema();
+  const { rows } = await pool().query(
+    "SELECT DISTINCT pl.id, pl.absolute_path FROM plan_steps ps JOIN plans pl ON pl.id = ps.plan_id WHERE ps.files IS NULL",
+  );
+  let updated = 0;
+  for (const plan of rows) {
+    if (!plan.absolute_path) continue;
+    let stepFiles = {};
+    try {
+      stepFiles = await extractStepFilesFromFile(plan.absolute_path);
+    } catch { stepFiles = {}; }
+    if (!Object.keys(stepFiles).length) continue;
+    for (const [stepId, files] of Object.entries(stepFiles)) {
+      const r = await pool().query(
+        "UPDATE plan_steps SET files = $1 WHERE plan_id = $2 AND step_id = $3 AND files IS NULL",
+        [JSON.stringify(files), plan.id, stepId],
+      );
+      updated += r.rowCount;
+    }
+  }
+  return { updated };
 }
 
 export async function updateStepStatus(planId, stepId, status, note) {

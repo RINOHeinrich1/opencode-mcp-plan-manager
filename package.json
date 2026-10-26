@@ -1,6 +1,6 @@
 {
   "name": "plan-manager-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server for managing atomic-plan generated plans (progression, incidents, inconsistencies, notifications, status reports).",
   "type": "module",
   "main": "index.mjs",

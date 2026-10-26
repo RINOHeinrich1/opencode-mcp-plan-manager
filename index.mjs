@@ -80,6 +80,39 @@ function extractSteps(absPath) {
   return [...new Set(ids)];
 }
 
+// Extrait, pour chaque étape du tableau atomic-plan, les FICHIERS touchés
+// (Phase 3). Colonne fichier DÉTECTÉE par contenu (chemin avec extension /
+// `…/…`), pas par position fixe (tableau à 6 ou 7 colonnes selon le plan).
+function extractStepFiles(absPath) {
+  const out = {};
+  if (!existsSync(absPath)) return out;
+  const txt = readFileSync(absPath, "utf8");
+  const FILE_RE = /`([^`]*(?:\.(?:tsx?|jsx?|mjs|cjs|json|md|feature|css|html|sql|yml|yaml|py|vue))[^`]*)`|`([^`]*\/[^`]*)`/gi;
+  const plausible = (p) => {
+    const s = String(p || "").trim();
+    if (!s || /\s/.test(s)) return false;
+    if (s.startsWith("npm") || s.startsWith("git") || s.startsWith("yarn")) return false;
+    return /\.(tsx?|jsx?|mjs|cjs|json|md|css|html|sql|ya?ml|py|vue|feature|env)$/i.test(s) || /\*\.([a-z0-9]+)$/i.test(s);
+  };
+  for (const line of txt.split(/\r?\n/)) {
+    if (!line.startsWith("|")) continue;
+    const cells = line.split("|").slice(1, -1).map((c) => c.trim());
+    if (!cells.length || !/^[A-Z]\d{3}$/.test(cells[0])) continue;
+    const all = [];
+    for (const c of cells) {
+      for (const m of c.matchAll(FILE_RE)) { const v = m[1] || m[2]; if (v && plausible(v)) all.push(v.trim()); }
+    }
+    if (!all.length) {
+      for (const c of cells) {
+        const m = /([A-Za-z0-9_\-./]+\.(?:tsx?|jsx?|mjs|cjs|md|json|css|feature))/.exec(c);
+        if (m && plausible(m[1])) all.push(m[1]);
+      }
+    }
+    if (all.length) out[cells[0]] = [...new Set(all.map((p) => p.replace(/^\.?\//, "")))];
+  }
+  return out;
+}
+
 // --- Générateurs de documents markdown (transitoires) ----------------------
 function writeProgressionDoc(plan) {
   const lines = [];
@@ -178,6 +211,7 @@ server.registerTool("plan_register", {
     const id = planIdOf(planFile);
     if (await getPlan(id)) return err(`plan déjà enregistré : ${id}`);
     const list = (steps && steps.length ? steps : extractSteps(abs));
+    const stepFiles = extractStepFiles(abs);
     const plan = await createPlan({
       id,
       taskId,
@@ -186,9 +220,10 @@ server.registerTool("plan_register", {
       absolutePath: abs,
       deliverables: deliverables || [],
       steps: list,
+      stepFiles,
     });
     const progDoc = writeProgressionDoc(plan);
-    return text(JSON.stringify({ ok: true, planId: id, steps: list, progressionDoc: progDoc }, null, 2));
+    return text(JSON.stringify({ ok: true, planId: id, steps: list, stepFiles, progressionDoc: progDoc }, null, 2));
   } catch (e) {
     return err(e.message);
   }
